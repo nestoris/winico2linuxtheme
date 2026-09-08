@@ -21,6 +21,8 @@ if (ARGV.includes('-h') || ARGV.includes('--help')) {
     print("  -t ФАЙЛ       Путь к файлу index.theme темы");
     print("  -c КОНТЕКСТ   Контекст для выбора (actions, devices, mimetypes, places и др.)");
     print("  -n ИМЯ        Имя значка без расширения");
+    print("  -s РАЗМЕР     Размер отображения значков в пикселях (по умолчанию: оригинальный)");
+    print("  -b            Включить сглаживание (библинейную интерполяцию) при масштабировании");
     print("  -h, --help    Показать эту справку и выйти");
     print("");
     print("Аргументы:");
@@ -30,6 +32,8 @@ if (ARGV.includes('-h') || ARGV.includes('--help')) {
     print("  " + scriptName + " icon.ico");
     print("  " + scriptName + " -t /path/to/index.theme -c devices icon.ico");
     print("  " + scriptName + " -t theme/index.theme -c actions -n my-icon icon.ico");
+    print("  " + scriptName + " -s 64 icon.ico");
+    print("  " + scriptName + " -s 128 -b icon.ico");
     print("  " + scriptName + " -h");
     print("");
     print("Формат INI-файла (создаётся рядом с ICO):");
@@ -37,6 +41,8 @@ if (ARGV.includes('-h') || ARGV.includes('--help')) {
     print("  name=иконка");
     print("  context=devices");
     print("  themefile=/путь/к/index.theme");
+    print("  scale=128        # размер отображения (опционально)");
+    print("  blur=true        # сглаживание при масштабировании (опционально)");
     print("");
     print("  [bit-depth]");
     print("  16x16=8");
@@ -61,6 +67,8 @@ let cmdlineThemeFile = null;
 let cmdlineContext = null;
 let cmdlineIconName = null;
 let cmdlineIcoFile = null;
+let cmdlineScale = null;
+let cmdlineBlur = false;
 
 let args = ARGV.slice();
 for (let i = 0; i < args.length; i++) {
@@ -73,6 +81,15 @@ for (let i = 0; i < args.length; i++) {
     } else if (args[i] === '-n' && i + 1 < args.length) {
         cmdlineIconName = args[i + 1];
         i++;
+    } else if (args[i] === '-s' && i + 1 < args.length) {
+        cmdlineScale = parseInt(args[i + 1]);
+        if (isNaN(cmdlineScale) || cmdlineScale < 1) {
+            log("Ошибка: размер должен быть положительным числом");
+            imports.system.exit(1);
+        }
+        i++;
+    } else if (args[i] === '-b') {
+        cmdlineBlur = true;
     } else if (!args[i].startsWith('-')) {
         cmdlineIcoFile = args[i];
     }
@@ -229,6 +246,8 @@ function parseIniFile(iniFilePath) {
         name: '',
         themefile: '',
         context: '',
+        scale: null,
+        blur: false,
         bitDepths: {}
     };
     
@@ -269,6 +288,15 @@ function parseIniFile(iniFilePath) {
                     if (key === 'name') iniData.name = value;
                     else if (key === 'themefile') iniData.themefile = value;
                     else if (key === 'context') iniData.context = value;
+                    else if (key === 'scale') {
+                        let scaleVal = parseInt(value);
+                        if (!isNaN(scaleVal) && scaleVal > 0) {
+                            iniData.scale = scaleVal;
+                        }
+                    }
+                    else if (key === 'blur') {
+                        iniData.blur = (value.toLowerCase() === 'true' || value === '1');
+                    }
                 } else if (currentSection === 'bit-depth') {
                     iniData.bitDepths[key] = parseInt(value) || 0;
                 }
@@ -401,6 +429,48 @@ function parseIcoFile(icoFilePath) {
     return formats;
 }
 
+// ==================== ФУНКЦИЯ МАСШТАБИРОВАНИЯ ИЗОБРАЖЕНИЙ ====================
+
+function scaleImage(pixbuf, targetSize, useBlur) {
+    if (!pixbuf) return null;
+    
+    let originalWidth = pixbuf.get_width();
+    let originalHeight = pixbuf.get_height();
+    
+    // Если целевой размер не задан или равен оригинальному, возвращаем как есть
+    if (!targetSize || (originalWidth === targetSize && originalHeight === targetSize)) {
+        return pixbuf;
+    }
+    
+    // Определяем тип интерполяции
+    let interpType = useBlur ? GdkPixbuf.InterpType.BILINEAR : GdkPixbuf.InterpType.NEAREST;
+    
+    // Масштабируем с сохранением пропорций, вписывая в квадрат targetSize x targetSize
+    let scale = Math.min(targetSize / originalWidth, targetSize / originalHeight);
+    let newWidth = Math.round(originalWidth * scale);
+    let newHeight = Math.round(originalHeight * scale);
+    
+    // Если новый размер совпадает с оригинальным, возвращаем как есть
+    if (newWidth === originalWidth && newHeight === originalHeight) {
+        return pixbuf;
+    }
+    
+    // Масштабируем до новых размеров
+    let scaled = pixbuf.scale_simple(newWidth, newHeight, interpType);
+    
+    // Если нужно вписать в квадрат targetSize x targetSize, создаём центрированное изображение
+    if (newWidth !== targetSize || newHeight !== targetSize) {
+        let centered = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, true, 8, targetSize, targetSize);
+        centered.fill(0x00000000); // Прозрачный фон
+        scaled.copy_area(0, 0, newWidth, newHeight, centered, 
+                         Math.floor((targetSize - newWidth) / 2), 
+                         Math.floor((targetSize - newHeight) / 2));
+        return centered;
+    }
+    
+    return scaled;
+}
+
 // ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 
 let dirArray = {};
@@ -412,6 +482,8 @@ let themeFilePath = '';
 let pendingContext = null;
 let iniData = null;
 let bottomHboxes = [];
+let displayScale = null;  // Размер отображения значков
+let useBlur = false;     // Использовать ли сглаживание
 
 let window = new Gtk.Window({
     title: "Установщик значков",
@@ -654,8 +726,18 @@ function updateIcoImage(blockData) {
         );
         
         if (success && exitStatus === 0) {
-            let pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(tempFile, 128, 128);
-            blockData.leftImage.set_from_pixbuf(pixbuf);
+            // Загружаем изображение
+            let pixbuf = GdkPixbuf.Pixbuf.new_from_file(tempFile);
+            
+            // Масштабируем, если нужно
+            let displaySize = displayScale || Math.max(parseInt(width), parseInt(height));
+            let scaledPixbuf = scaleImage(pixbuf, displaySize, useBlur);
+            
+            if (scaledPixbuf) {
+                blockData.leftImage.set_from_pixbuf(scaledPixbuf);
+            } else {
+                blockData.leftImage.set_from_pixbuf(pixbuf);
+            }
             
             // Удаляем предыдущий временный файл
             if (blockData.lastTempFile) {
@@ -695,8 +777,19 @@ function updateThemeImage(blockData) {
     let filePath = GLib.build_filenamev([dirPath, fileName]);
     
     try {
-        let pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(filePath, 128, 128);
-        blockData.rightImage.set_from_pixbuf(pixbuf);
+        let pixbuf = GdkPixbuf.Pixbuf.new_from_file(filePath);
+        
+        // Определяем размер для отображения (используем тот же, что и для левого изображения)
+        let format = blockData.format;
+        let [width, height] = format.split('x');
+        let displaySize = displayScale || Math.max(parseInt(width), parseInt(height));
+        let scaledPixbuf = scaleImage(pixbuf, displaySize, useBlur);
+        
+        if (scaledPixbuf) {
+            blockData.rightImage.set_from_pixbuf(scaledPixbuf);
+        } else {
+            blockData.rightImage.set_from_pixbuf(pixbuf);
+        }
     } catch (e) {
         blockData.rightImage.set_from_icon_name("image-missing", Gtk.IconSize.DIALOG);
     }
@@ -832,6 +925,14 @@ function saveIniFile() {
         iniContent += 'themefile=\n';
     }
     
+    if (displayScale) {
+        iniContent += 'scale=' + displayScale + '\n';
+    }
+    
+    if (useBlur) {
+        iniContent += 'blur=true\n';
+    }
+    
     iniContent += '\n[bit-depth]\n';
     
     let sortedFormats = Object.keys(icoFormats).sort((a, b) => {
@@ -887,6 +988,23 @@ function loadIcoWithIni(filePath) {
     
     iniData = parseIniFile(iniFilePath);
     let defaultBitDepths = {};
+    
+    // Устанавливаем параметры из INI
+    if (iniData.scale) {
+        displayScale = iniData.scale;
+        print("Размер отображения из INI: " + displayScale);
+    } else if (cmdlineScale) {
+        displayScale = cmdlineScale;
+        print("Размер отображения из аргументов: " + displayScale);
+    }
+    
+    if (iniData.blur) {
+        useBlur = true;
+        print("Сглаживание включено из INI");
+    } else if (cmdlineBlur) {
+        useBlur = true;
+        print("Сглаживание включено из аргументов");
+    }
     
     if (iniData.name) {
         print("Загружен INI файл: " + iniFilePath);

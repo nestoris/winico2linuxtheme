@@ -15,12 +15,14 @@ let scriptName = GLib.path_get_basename(imports.system.programInvocationName);
 
 if (ARGV.includes('-h') || ARGV.includes('--help')) {
     print("Usage: " + GLib.path_get_basename(ARGV[0]) + " [OPTIONS] [ICO_FILE]\n");
-    print("View icons from ICO files and install into Linux theme.");
+    print("View icons from ICO files and install them into Linux themes.");
     print("");
     print("Options:");
-    print("  -t FILE       Path to theme index.theme file");
-    print("  -c CONTEXT    Context to select (actions, devices, mimetypes, places, etc.)");
+    print("  -t FILE       Path to the index.theme theme file");
+    print("  -c CONTEXT    Context for selection (actions, devices, mimetypes, places, etc.)");
     print("  -n NAME       Icon name without extension");
+    print("  -s SIZE       Display size of icons in pixels (default: original)");
+    print("  -b            Enable smoothing (bilinear interpolation) when scaling");
     print("  -h, --help    Show this help and exit");
     print("");
     print("Arguments:");
@@ -30,13 +32,17 @@ if (ARGV.includes('-h') || ARGV.includes('--help')) {
     print("  " + scriptName + " icon.ico");
     print("  " + scriptName + " -t /path/to/index.theme -c devices icon.ico");
     print("  " + scriptName + " -t theme/index.theme -c actions -n my-icon icon.ico");
+    print("  " + scriptName + " -s 64 icon.ico");
+    print("  " + scriptName + " -s 128 -b icon.ico");
     print("  " + scriptName + " -h");
     print("");
-    print("INI file format (created alongside ICO):");
+    print("INI file format (created next to ICO):");
     print("  [defaults]");
     print("  name=icon");
     print("  context=devices");
     print("  themefile=/path/to/index.theme");
+    print("  scale=128        # display size (optional)");
+    print("  blur=true        # smoothing when scaling (optional)");
     print("");
     print("  [bit-depth]");
     print("  16x16=8");
@@ -61,6 +67,8 @@ let cmdlineThemeFile = null;
 let cmdlineContext = null;
 let cmdlineIconName = null;
 let cmdlineIcoFile = null;
+let cmdlineScale = null;
+let cmdlineBlur = false;
 
 let args = ARGV.slice();
 for (let i = 0; i < args.length; i++) {
@@ -73,6 +81,15 @@ for (let i = 0; i < args.length; i++) {
     } else if (args[i] === '-n' && i + 1 < args.length) {
         cmdlineIconName = args[i + 1];
         i++;
+    } else if (args[i] === '-s' && i + 1 < args.length) {
+        cmdlineScale = parseInt(args[i + 1]);
+        if (isNaN(cmdlineScale) || cmdlineScale < 1) {
+            log("Error: size must be a positive number");
+            imports.system.exit(1);
+        }
+        i++;
+    } else if (args[i] === '-b') {
+        cmdlineBlur = true;
     } else if (!args[i].startsWith('-')) {
         cmdlineIcoFile = args[i];
     }
@@ -167,7 +184,7 @@ function compareImages(leftPngPath, rightPngPath) {
         return { status: "XXX", label: "XXX" };
     }
     
-    // Compare dimensions
+    // Compare sizes
     let sizeMatch = (leftInfo.width === rightInfo.width && leftInfo.height === rightInfo.height);
     
     // Build size comparison string
@@ -180,7 +197,7 @@ function compareImages(leftPngPath, rightPngPath) {
         sizeLabel = xChar + yChar + ':' + rxChar + ryChar;
     }
     
-    // Compare timestamps
+    // Compare time
     if (leftInfo.mtime && rightInfo.mtime) {
         if (leftInfo.mtime.compare(rightInfo.mtime) > 0) {
             // Left is newer
@@ -203,7 +220,7 @@ function compareImages(leftPngPath, rightPngPath) {
         }
     }
     
-    // If timestamps couldn't be compared
+    // If time comparison failed
     if (sizeMatch) {
         // Compare content
         try {
@@ -229,6 +246,8 @@ function parseIniFile(iniFilePath) {
         name: '',
         themefile: '',
         context: '',
+        scale: null,
+        blur: false,
         bitDepths: {}
     };
     
@@ -269,6 +288,15 @@ function parseIniFile(iniFilePath) {
                     if (key === 'name') iniData.name = value;
                     else if (key === 'themefile') iniData.themefile = value;
                     else if (key === 'context') iniData.context = value;
+                    else if (key === 'scale') {
+                        let scaleVal = parseInt(value);
+                        if (!isNaN(scaleVal) && scaleVal > 0) {
+                            iniData.scale = scaleVal;
+                        }
+                    }
+                    else if (key === 'blur') {
+                        iniData.blur = (value.toLowerCase() === 'true' || value === '1');
+                    }
                 } else if (currentSection === 'bit-depth') {
                     iniData.bitDepths[key] = parseInt(value) || 0;
                 }
@@ -359,7 +387,7 @@ function parseIcoFile(icoFilePath) {
         );
         
         if (!success || exitStatus !== 0) {
-            log("Error executing icotool: " + imports.byteArray.toString(stderr));
+            log("Error running icotool: " + imports.byteArray.toString(stderr));
             return formats;
         }
         
@@ -401,6 +429,48 @@ function parseIcoFile(icoFilePath) {
     return formats;
 }
 
+// ==================== IMAGE SCALING FUNCTION ====================
+
+function scaleImage(pixbuf, targetSize, useBlur) {
+    if (!pixbuf) return null;
+    
+    let originalWidth = pixbuf.get_width();
+    let originalHeight = pixbuf.get_height();
+    
+    // If target size is not set or equals original, return as is
+    if (!targetSize || (originalWidth === targetSize && originalHeight === targetSize)) {
+        return pixbuf;
+    }
+    
+    // Determine interpolation type
+    let interpType = useBlur ? GdkPixbuf.InterpType.BILINEAR : GdkPixbuf.InterpType.NEAREST;
+    
+    // Scale while preserving aspect ratio, fitting into targetSize x targetSize square
+    let scale = Math.min(targetSize / originalWidth, targetSize / originalHeight);
+    let newWidth = Math.round(originalWidth * scale);
+    let newHeight = Math.round(originalHeight * scale);
+    
+    // If new size matches original, return as is
+    if (newWidth === originalWidth && newHeight === originalHeight) {
+        return pixbuf;
+    }
+    
+    // Scale to new dimensions
+    let scaled = pixbuf.scale_simple(newWidth, newHeight, interpType);
+    
+    // If need to fit into targetSize x targetSize square, create centered image
+    if (newWidth !== targetSize || newHeight !== targetSize) {
+        let centered = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, true, 8, targetSize, targetSize);
+        centered.fill(0x00000000); // Transparent background
+        scaled.copy_area(0, 0, newWidth, newHeight, centered, 
+                         Math.floor((targetSize - newWidth) / 2), 
+                         Math.floor((targetSize - newHeight) / 2));
+        return centered;
+    }
+    
+    return scaled;
+}
+
 // ==================== GLOBAL VARIABLES ====================
 
 let dirArray = {};
@@ -412,6 +482,8 @@ let themeFilePath = '';
 let pendingContext = null;
 let iniData = null;
 let bottomHboxes = [];
+let displayScale = null;  // Icon display size
+let useBlur = false;     // Whether to use smoothing
 
 let window = new Gtk.Window({
     title: "Icon Installer",
@@ -613,7 +685,7 @@ function createBottomHbox(format, bitDepths, defaultBitDepth) {
 
 function clearAllBottomBlocks() {
     bottomHboxes.forEach(block => {
-        // Remove temporary files
+        // Delete temporary files
         if (block.lastTempFile) {
             GLib.unlink(block.lastTempFile);
         }
@@ -654,8 +726,18 @@ function updateIcoImage(blockData) {
         );
         
         if (success && exitStatus === 0) {
-            let pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(tempFile, 128, 128);
-            blockData.leftImage.set_from_pixbuf(pixbuf);
+            // Load image
+            let pixbuf = GdkPixbuf.Pixbuf.new_from_file(tempFile);
+            
+            // Scale if needed
+            let displaySize = displayScale || Math.max(parseInt(width), parseInt(height));
+            let scaledPixbuf = scaleImage(pixbuf, displaySize, useBlur);
+            
+            if (scaledPixbuf) {
+                blockData.leftImage.set_from_pixbuf(scaledPixbuf);
+            } else {
+                blockData.leftImage.set_from_pixbuf(pixbuf);
+            }
             
             // Delete previous temporary file
             if (blockData.lastTempFile) {
@@ -695,8 +777,19 @@ function updateThemeImage(blockData) {
     let filePath = GLib.build_filenamev([dirPath, fileName]);
     
     try {
-        let pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(filePath, 128, 128);
-        blockData.rightImage.set_from_pixbuf(pixbuf);
+        let pixbuf = GdkPixbuf.Pixbuf.new_from_file(filePath);
+        
+        // Determine display size (use same as left image)
+        let format = blockData.format;
+        let [width, height] = format.split('x');
+        let displaySize = displayScale || Math.max(parseInt(width), parseInt(height));
+        let scaledPixbuf = scaleImage(pixbuf, displaySize, useBlur);
+        
+        if (scaledPixbuf) {
+            blockData.rightImage.set_from_pixbuf(scaledPixbuf);
+        } else {
+            blockData.rightImage.set_from_pixbuf(pixbuf);
+        }
     } catch (e) {
         blockData.rightImage.set_from_icon_name("image-missing", Gtk.IconSize.DIALOG);
     }
@@ -737,7 +830,7 @@ function copyImageToTheme(blockData) {
     let dirPath = blockData.pathEntry.get_text();
     
     if (!iconName || !dirPath) {
-        log("Destination path not specified");
+        log("No destination path specified");
         return;
     }
     
@@ -760,7 +853,7 @@ function copyImageToTheme(blockData) {
         updateThemeImage(blockData);
         updateComparison(blockData);
     } catch (e) {
-        log("Copy error: " + e.message);
+        log("Error copying: " + e.message);
     }
 }
 
@@ -790,7 +883,7 @@ function updateAllPathEntries() {
             block.pathEntry.set_text(fullPath);
             block.hasThemeDir = true;
         } else {
-            // No suitable directory
+            // No matching directory
             block.pathEntry.set_text("No directory for " + format);
             block.hasThemeDir = false;
             block.rightImage.set_from_icon_name("image-missing", Gtk.IconSize.DIALOG);
@@ -832,6 +925,14 @@ function saveIniFile() {
         iniContent += 'themefile=\n';
     }
     
+    if (displayScale) {
+        iniContent += 'scale=' + displayScale + '\n';
+    }
+    
+    if (useBlur) {
+        iniContent += 'blur=true\n';
+    }
+    
     iniContent += '\n[bit-depth]\n';
     
     let sortedFormats = Object.keys(icoFormats).sort((a, b) => {
@@ -864,7 +965,7 @@ function saveIniFile() {
             log("Error saving INI file");
         }
     } catch (e) {
-        log("Write error: " + e.message);
+        log("Error writing: " + e.message);
     }
 }
 
@@ -887,6 +988,23 @@ function loadIcoWithIni(filePath) {
     
     iniData = parseIniFile(iniFilePath);
     let defaultBitDepths = {};
+    
+    // Set parameters from INI
+    if (iniData.scale) {
+        displayScale = iniData.scale;
+        print("Display size from INI: " + displayScale);
+    } else if (cmdlineScale) {
+        displayScale = cmdlineScale;
+        print("Display size from arguments: " + displayScale);
+    }
+    
+    if (iniData.blur) {
+        useBlur = true;
+        print("Smoothing enabled from INI");
+    } else if (cmdlineBlur) {
+        useBlur = true;
+        print("Smoothing enabled from arguments");
+    }
     
     if (iniData.name) {
         print("Loaded INI file: " + iniFilePath);
@@ -1081,7 +1199,7 @@ searchEntry.connect("changed", () => {
     });
 });
 
-// ==================== LAYOUT COMPOSITION ====================
+// ==================== LAYOUT ====================
 
 scrollWindow.add(scrollVbox);
 mainVbox.pack_start(topHbox, false, false, 0);
